@@ -32,20 +32,14 @@ import (
 var staticFiles embed.FS
 
 var (
-	webUser            string
-	webPassword        string
 	encryptionKey      []byte
-	noAuth             bool
 	disableDownload    bool
 	disableFileBrowser bool
-	sessionStore       = make(map[string]string)
-	sessionMutex       sync.RWMutex
 	connections        = make(map[string]SSHConnection)
 	connectionsMutex   sync.RWMutex
 )
 
 const connectionsFile = "connections.json"
-const sessionCookieName = "webssh_session"
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -119,126 +113,7 @@ type wsMessage struct {
 	Path     string `json:"path,omitempty"`
 }
 
-// --- Session Management ---
-
-func createSession(username string) (string, error) {
-	if noAuth {
-		return "no-auth-session", nil
-	}
-	sessionIDBytes := make([]byte, 32)
-	if _, err := rand.Read(sessionIDBytes); err != nil {
-		return "", err
-	}
-	sessionID := hex.EncodeToString(sessionIDBytes)
-
-	sessionMutex.Lock()
-	sessionStore[sessionID] = username
-	sessionMutex.Unlock()
-
-	return sessionID, nil
-}
-
-func getSessionUser(r *http.Request) string {
-	if noAuth {
-		return "no-auth-user"
-	}
-	cookie, err := r.Cookie(sessionCookieName)
-	if err != nil {
-		return ""
-	}
-
-	sessionMutex.RLock()
-	username, ok := sessionStore[cookie.Value]
-	sessionMutex.RUnlock()
-
-	if !ok {
-		return ""
-	}
-	return username
-}
-
-func clearSession(w http.ResponseWriter, r *http.Request) {
-	cookie, err := r.Cookie(sessionCookieName)
-	if err != nil {
-		return
-	}
-
-	sessionMutex.Lock()
-	delete(sessionStore, cookie.Value)
-	sessionMutex.Unlock()
-
-	http.SetCookie(w, &http.Cookie{
-		Name:   sessionCookieName,
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
-	})
-}
-
-// --- Middleware ---
-
-func authMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if noAuth {
-			next.ServeHTTP(w, r)
-			return
-		}
-		if getSessionUser(r) == "" {
-			http.Redirect(w, r, "/login", http.StatusFound)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 // --- HTTP Handlers ---
-
-func handleLogin(w http.ResponseWriter, r *http.Request) {
-	if noAuth {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
-	if r.Method == http.MethodGet {
-		content, _ := staticFiles.ReadFile("static/login.html")
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(content)
-		return
-	}
-
-	if r.Method == http.MethodPost {
-		r.ParseForm()
-		username := r.FormValue("username")
-		password := r.FormValue("password")
-
-		if username == webUser && password == webPassword {
-			sessionID, err := createSession(username)
-			if err != nil {
-				http.Error(w, "Failed to create session", http.StatusInternalServerError)
-				return
-			}
-			http.SetCookie(w, &http.Cookie{
-				Name:     sessionCookieName,
-				Value:    sessionID,
-				Path:     "/",
-				HttpOnly: true,
-				MaxAge:   86400, // 24 hours
-			})
-			http.Redirect(w, r, "/", http.StatusFound)
-		} else {
-			log.Println("Login failed for user:", username)
-			http.Redirect(w, r, "/login?error=1", http.StatusFound)
-		}
-	}
-}
-
-func handleLogout(w http.ResponseWriter, r *http.Request) {
-	if noAuth {
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
-	}
-	clearSession(w, r)
-	http.Redirect(w, r, "/login", http.StatusFound)
-}
 
 func handleRoot(w http.ResponseWriter, r *http.Request) {
 	content, _ := staticFiles.ReadFile("static/index.html")
@@ -354,11 +229,6 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	if getSessionUser(r) == "" {
-		http.Error(w, "Not authorized", http.StatusUnauthorized)
-		return
-	}
-
 	connID := r.URL.Query().Get("id")
 	connectionsMutex.RLock()
 	sshConn, ok := connections[connID]
@@ -654,33 +524,9 @@ func handleFeatures(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	var (
-		enableTLS bool
-		certFile  string
-		keyFile   string
-	)
-
-	flag.BoolVar(&noAuth, "no-auth", false, "Disable authentication")
-	flag.BoolVar(&enableTLS, "tls", false, "Enable TLS for HTTPS and WSS")
-	flag.StringVar(&certFile, "cert-file", "", "Path to TLS certificate file")
-	flag.StringVar(&keyFile, "key-file", "", "Path to TLS key file")
 	flag.BoolVar(&disableDownload, "disable-download", false, "Disable only the file download functionality")
 	flag.BoolVar(&disableFileBrowser, "disable-file-browser", false, "Disable the entire file browser (upload, download, list)")
 	flag.Parse()
-
-	if !noAuth {
-		webUser = os.Getenv("WEBSSH_USER")
-		webPassword = os.Getenv("WEBSSH_PASSWORD")
-		if webUser == "" || webPassword == "" {
-			log.Fatal("FATAL: Environment variables WEBSSH_USER and WEBSSH_PASSWORD must be set when authentication is enabled.")
-		}
-	} else {
-		log.Println("Authentication is disabled.")
-	}
-
-	if enableTLS && (certFile == "" || keyFile == "") {
-		log.Fatal("FATAL: --cert-file and --key-file must be provided when --tls is enabled.")
-	}
 
 	keyHex := os.Getenv("WEBSSH_ENCRYPTION_KEY")
 	if keyHex == "" {
@@ -697,23 +543,14 @@ func main() {
 	staticFS, _ := fs.Sub(staticFiles, "static")
 	staticServer := http.FileServer(http.FS(staticFS))
 
-	http.HandleFunc("/login", handleLogin)
 	http.Handle("/static/", http.StripPrefix("/static/", staticServer))
-	http.Handle("/", authMiddleware(http.HandlerFunc(handleRoot)))
-	http.Handle("/logout", authMiddleware(http.HandlerFunc(handleLogout)))
-	http.Handle("/api/connections", authMiddleware(http.HandlerFunc(handleConnections)))
-	http.Handle("/ws", authMiddleware(http.HandlerFunc(handleWebSocket)))
-	http.Handle("/api/features", authMiddleware(http.HandlerFunc(handleFeatures)))
+	http.HandleFunc("/", handleRoot)
+	http.HandleFunc("/api/connections", handleConnections)
+	http.HandleFunc("/ws", handleWebSocket)
+	http.HandleFunc("/api/features", handleFeatures)
 
-	if enableTLS {
-		log.Println("Server started with TLS on :8443")
-		if err := http.ListenAndServeTLS(":8443", certFile, keyFile, nil); err != nil {
-			log.Fatal(err)
-		}
-	} else {
-		log.Println("Server started on :8080")
-		if err := http.ListenAndServe(":8080", nil); err != nil {
-			log.Fatal(err)
-		}
+	log.Println("Server started on :8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatal(err)
 	}
 }
